@@ -1,0 +1,46 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check PHP syntax
+        run: for f in *.php tests/*.php; do php -l "$f"; done
+      - name: Create database
+        run: mysql -h 127.0.0.1 -uroot -proot < schema.sql
+      - name: Write config.php
+        run: |
+          cat > config.php <<'PHP'
+          <?php
+          $hostname = '127.0.0.1';
+          $username = 'root';
+          $password = 'root';
+          $dbname   = 'web_db';
+          PHP
+      - name: Run tests
+        run: |
+          php -S 127.0.0.1:8000 > server.log 2>&1 &
+          sleep 1
+          php tests/run_tests.php
+      - name: Show server log
+        if: failure()
+        run: cat server.log

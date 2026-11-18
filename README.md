@@ -1,5 +1,7 @@
 # 予約管理システム
 
+[![test](https://github.com/mimish0778/reservation-system/actions/workflows/test.yml/badge.svg)](https://github.com/mimish0778/reservation-system/actions/workflows/test.yml)
+
 PHP と MySQL で作った、1 時間単位の時間枠を予約できる Web アプリケーションです。利用者は空いている時間枠の予約と取り消しができ、管理者はユーザー、予約、お知らせを管理できます。
 
 アプリ本体は `reservation_system.php` の 1 ファイルで、フレームワークは使っていません。
@@ -105,6 +107,17 @@ PHP 8.3 と MariaDB 10.11 で動作を確認しています。
 
 `schema.sql` は提出用のドキュメントから復元したもので、列の型には推定が含まれます。
 
+## テスト
+
+`tests/run_tests.php` は、サーバーに HTTP でリクエストを送って、画面の動作とセキュリティ対策を確認します（サインアップ、予約、二重予約、権限、CSRF、SQL インジェクション、XSS、平文パスワードからの移行など 30 項目）。
+
+```bash
+php -S 127.0.0.1:8000 &
+php tests/run_tests.php
+```
+
+テストのたびにテーブルの中身を空にするので、テスト用のデータベースで実行してください。GitHub Actions では、MySQL を起動して push ごとに実行しています。
+
 ## プロジェクト構成
 
 ```
@@ -112,7 +125,8 @@ PHP 8.3 と MariaDB 10.11 で動作を確認しています。
 ├── reservation_system.php  アプリ本体
 ├── create_admin.php        最初の管理者を作るコマンドラインスクリプト
 ├── config.example.php      データベース接続設定のひな形
-└── schema.sql              データベースとテーブルの定義
+├── schema.sql              データベースとテーブルの定義
+└── tests/run_tests.php     動作とセキュリティ対策のテスト
 ```
 
 画面の切り替えは、各フォームが送る `transition` の値で、データの追加・削除・更新は `operation` の値で振り分けています。すべての画面が `reservation_system.php` への POST で表示されます。
