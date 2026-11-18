@@ -22,7 +22,7 @@ jobs:
           --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
           --health-interval=5s --health-timeout=5s --health-retries=20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Check PHP syntax
         run: for f in *.php tests/*.php; do php -l "$f"; done
       - name: Create database
