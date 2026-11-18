@@ -17,6 +17,8 @@ const PASSWORD_MIN_LENGTH = 8;
 const TIMEZONE = 'Asia/Tokyo';
 date_default_timezone_set(TIMEZONE);
 const NAME_MAX_LENGTH     = 50;
+// おしらせの宛先で「全員」を表す名前。ユーザ名には使えない
+const EVERYONE = 'everyone';
 
 // ------------------------------------------------------------
 // セッションとレスポンスヘッダー
@@ -226,6 +228,9 @@ function signup(): ?string
     if (!valid_tel($tel)) {
         return '電話番号は数字とハイフンで入力してください';
     }
+    if (strcasecmp($name, EVERYONE) === 0) {
+        return 'このユーザ名は使用できません';
+    }
     if (fetch_all('SELECT id FROM ' . USER_TABLE . ' WHERE user = ?', 's', [$name])) {
         return 'このユーザ名はすでに使用されています';
     }
@@ -325,7 +330,24 @@ function user_delete(array $me): ?string
     if ($id === (int)$me['id']) {
         return '自分自身は削除できません';
     }
-    query('DELETE FROM ' . USER_TABLE . ' WHERE id = ?', 'i', [$id]);
+    $rows = fetch_all('SELECT user FROM ' . USER_TABLE . ' WHERE id = ?', 'i', [$id]);
+    if (!$rows) {
+        return null;
+    }
+    // 予約とおしらせはユーザ名で紐付いているため、一緒に消す。
+    // 残すと、同じ名前で新しく登録した人に前の人の予約や個人宛のおしらせが見えてしまう
+    $name = $rows[0]['user'];
+    $link = db();
+    $link->begin_transaction();
+    try {
+        query('DELETE FROM ' . RESERVATION_TABLE . ' WHERE user = ?', 's', [$name]);
+        query('DELETE FROM ' . NOTICE_TABLE . ' WHERE addressee = ?', 's', [$name]);
+        query('DELETE FROM ' . USER_TABLE . ' WHERE id = ?', 'i', [$id]);
+        $link->commit();
+    } catch (Throwable $e) {
+        $link->rollback();
+        throw $e;
+    }
     return null;
 }
 
@@ -428,8 +450,8 @@ function echo_page_main(array $me, string $msg): void
 
         echo '<hr><h3>&lt;おしらせ&gt;</h3>';
         $rows = fetch_all('SELECT date, notice FROM ' . NOTICE_TABLE
-                        . " WHERE addressee = ? OR addressee = 'everyone' ORDER BY date DESC",
-                          's', [$me['user']]);
+                        . ' WHERE addressee = ? OR addressee = ? ORDER BY date DESC',
+                          'ss', [$me['user'], EVERYONE]);
         foreach ($rows as $row) {
             echo h($row['date']) . '<br>' . nl2br(h($row['notice'])) . '<br><br>';
         }
@@ -558,7 +580,7 @@ function echo_page_notice_add(): void
 {
     echo '<h1>投稿の追加</h1><hr><hr>';
     echo form_open('trans_notice_manage', 'notice_add');
-    echo '    宛先<textarea name="addressee" rows="1" cols="10">everyone</textarea><br>';
+    echo '    宛先<textarea name="addressee" rows="1" cols="10">' . EVERYONE . '</textarea><br>';
     echo '    日付<input type="text" name="date" placeholder="yyyymmdd"><br>';
     echo '    記事<textarea name="notice" rows="5" cols="30"></textarea><br>';
     echo '    <button type="submit">投稿する</button>';

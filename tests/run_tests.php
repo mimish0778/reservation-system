@@ -197,5 +197,24 @@ check('ログアウト後は操作できない', scalar('SELECT COUNT(*) FROM re
 $legacy = login('legacy', 'plainpass');
 check('一般ユーザに全員宛てのお知らせが表示される', str_contains($legacy->text(), '<script>alert(1)</script>お知らせ'));
 
+// --- ユーザの削除
+$everyone = new Client();
+$everyone->post(['transition' => 'trans_signup_re', 'user' => 'Everyone', 'pass' => 'everyonepass']);
+check('全員宛てを表す名前では登録できない', str_contains($everyone->text(), '使用できません') && scalar("SELECT COUNT(*) FROM userTable WHERE user = 'everyone'") == 0);
+$bob = new Client();
+$bob->post(['transition' => 'trans_signup_re', 'user' => 'bob', 'pass' => 'bobpass123']);
+$bob->post(['transition' => 'trans_main', 'operation' => 'reservation_add', 'date' => $future, 'time' => '15']);
+$bob_id = (int)scalar("SELECT id FROM userTable WHERE user = 'bob'");
+$admin->post(['transition' => 'trans_notice_manage', 'operation' => 'notice_add', 'addressee' => 'bob', 'date' => $future, 'notice' => 'bobさんへの個別連絡']);
+$admin->post(['transition' => 'trans_user_manage', 'operation' => 'user_delete', 'user_id' => (string)$bob_id]);
+check('ユーザを削除すると予約と個人宛てのお知らせも消える',
+      scalar("SELECT COUNT(*) FROM userTable WHERE user = 'bob'") == 0
+      && scalar("SELECT COUNT(*) FROM reservationTable WHERE user = 'bob'") == 0
+      && scalar("SELECT COUNT(*) FROM noticeTable WHERE addressee = 'bob'") == 0);
+$bob2 = new Client();
+$bob2->post(['transition' => 'trans_signup_re', 'user' => 'bob', 'pass' => 'newbobpass']);
+check('同じ名前で登録し直しても前の人の情報は見えない',
+      str_contains($bob2->text(), 'ご予約はありません') && !str_contains($bob2->text(), '個別連絡'));
+
 echo "\n{$passed} passed, {$failed} failed\n";
 exit($failed === 0 ? 0 : 1);
