@@ -201,6 +201,8 @@ check('一般ユーザに全員宛てのお知らせが表示される', str_con
 $everyone = new Client();
 $everyone->post(['transition' => 'trans_signup_re', 'user' => 'Everyone', 'pass' => 'everyonepass']);
 check('全員宛てを表す名前では登録できない', str_contains($everyone->text(), '使用できません') && scalar("SELECT COUNT(*) FROM userTable WHERE user = 'everyone'") == 0);
+$everyone->post(['transition' => 'trans_signup_re', 'user' => 'ＥＶＥＲＹＯＮＥ', 'pass' => 'everyonepass']);
+check('全角など、データベースが同じとみなす名前でも登録できない', str_contains($everyone->text(), '使用できません') && scalar("SELECT COUNT(*) FROM userTable WHERE user = 'everyone'") == 0);
 $bob = new Client();
 $bob->post(['transition' => 'trans_signup_re', 'user' => 'bob', 'pass' => 'bobpass123']);
 $bob->post(['transition' => 'trans_main', 'operation' => 'reservation_add', 'date' => $future, 'time' => '15']);

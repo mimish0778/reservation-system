@@ -139,6 +139,14 @@ function valid_tel(string $tel): bool
     return $tel === '' || preg_match('/\A[0-9+\-]{1,20}\z/', $tel) === 1;
 }
 
+// ユーザ名が同じかどうかを、テーブルと同じ照合順序で比べる。
+// PHP の strcasecmp では、データベースが同じとみなす全角文字やアクセント付きの文字
+// （'ＥＶＥＲＹＯＮＥ'、'éveryone' など）を見逃すため
+function same_name(string $a, string $b): bool
+{
+    return (bool)fetch_all('SELECT ? COLLATE utf8mb4_unicode_ci = ? AS same', 'ss', [$a, $b])[0]['same'];
+}
+
 function str_length(string $value): int
 {
     return mb_strlen($value, 'UTF-8');
@@ -228,7 +236,7 @@ function signup(): ?string
     if (!valid_tel($tel)) {
         return '電話番号は数字とハイフンで入力してください';
     }
-    if (strcasecmp($name, EVERYONE) === 0) {
+    if (same_name($name, EVERYONE)) {
         return 'このユーザ名は使用できません';
     }
     if (fetch_all('SELECT id FROM ' . USER_TABLE . ' WHERE user = ?', 's', [$name])) {
