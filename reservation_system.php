@@ -1,881 +1,702 @@
-<!DOCTYPE html>
-    <html>
-        <head>
-            <meta charset="UTF-8" />
-            <title>Reservation System</title>
-        </head>
 <?php
+declare(strict_types=1);
+
 require_once __DIR__ . '/config.php';
-$user_tablename = 'userTable';
-$reservation_tablename = 'reservationTable';
-$notice_tablename = 'noticeTable';
 
-$open_time = 9;
-$close_time = 18;
+const USER_TABLE        = 'userTable';
+const RESERVATION_TABLE = 'reservationTable';
+const NOTICE_TABLE      = 'noticeTable';
 
-mysqli_report(MYSQLI_REPORT_OFF);
+const OPEN_TIME  = 9;   // 最初の枠の開始時刻
+const CLOSE_TIME = 18;  // 最後の枠の開始時刻
 
-$is_member = 0;
-$is_manager = 0;
+const PASSWORD_MIN_LENGTH = 8;
+const NAME_MAX_LENGTH     = 50;
 
-//認証
-if (array_key_exists('user', $_POST))
+// ------------------------------------------------------------
+// セッションとレスポンスヘッダー
+// ------------------------------------------------------------
+ini_set('session.use_strict_mode', '1');
+session_set_cookie_params([
+    'httponly' => true,
+    'samesite' => 'Lax',
+    'secure'   => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
+]);
+session_start();
+
+header('Content-Type: text/html; charset=UTF-8');
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: DENY');
+header("Content-Security-Policy: default-src 'self'; frame-ancestors 'none'; form-action 'self'");
+header('Referrer-Policy: same-origin');
+
+mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+
+// ------------------------------------------------------------
+// 共通処理
+// ------------------------------------------------------------
+
+// 画面に出す値はすべてこの関数でエスケープする
+function h($value): string
 {
-    auth_signup();
-    auth_login();
+    return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
-//DB操作
-if(array_key_exists('operation', $_POST))
+function db(): mysqli
 {
-    if ($_POST['operation'] == "user_delete")
-    {
-        user_delete();
+    static $link = null;
+    if ($link === null) {
+        global $hostname, $username, $password, $dbname;
+        $link = new mysqli($hostname, $username, $password, $dbname);
+        $link->set_charset('utf8mb4');
     }
-    if ($_POST['operation'] == "user_edit")
-    {
-        user_edit();
-    }
-    if ($_POST['operation'] == "reservation_add")
-    {
-        reservation_add();
-    }
-    if ($_POST['operation'] == "reservation_delete")
-    {
-        reservation_delete();
-    }
-    if ($_POST['operation'] == "notice_add")
-    {
-        notice_add();
-    }
-    if ($_POST['operation'] == "notice_delete")
-    {
-        notice_delete();
-    }
-    if ($_POST['operation'] == "manager_add")
-    {
-        manager_add();
-    }
-    if ($_POST['operation'] == "manager_delete")
-    {
-        manager_delete();
-    }
-    
+    return $link;
 }
 
-//ページ遷移
-if ($is_member == 0)
+// プリペアドステートメントで SQL を実行する。入力値を SQL 文に直接埋め込まない
+function query(string $sql, string $types = '', array $params = []): mysqli_stmt
 {
-    if (!array_key_exists('transition', $_POST))
-    {
-        echo_page_login("");
+    $stmt = db()->prepare($sql);
+    if ($types !== '') {
+        $stmt->bind_param($types, ...$params);
     }
-    elseif ($_POST['transition'] == "trans_login")
-    {
-        echo_page_login("");
-    }
-    elseif ($_POST['transition'] == "trans_login_re")
-    {
-        echo_page_login("パスワードが違います");
-    }
-    elseif ($_POST['transition'] == "trans_signup")
-    {
-        echo_page_signup("");
-    }
-    elseif ($_POST['transition'] == "trans_signup_re")
-    {
-        echo_page_signup("このユーザ名はすでに使用されています");
-    }
-}
-else
-{
-    if ($_POST['transition'] == "trans_main")
-    {
-        echo_page_main();
-    }
-    elseif ($_POST['transition'] == "trans_reservation_add")
-    {
-        echo_page_reservation_add();
-    }
-    elseif ($_POST['transition'] == "trans_reservation_delete")
-    {
-        echo_page_reservation_delete();
-    }
-    elseif ($_POST['transition'] == "trans_user_edit")
-    {
-        echo_page_user_edit();
-    }
-    elseif ($_POST['transition'] == "trans_user_manage")
-    {
-        echo_page_user_manage();
-    }
-    elseif ($_POST['transition'] == "trans_reservation_manage")
-    {
-        echo_page_reservation_manage();
-    }
-    elseif ($_POST['transition'] == "trans_notice_manage")
-    {
-        echo_page_notice_manage();
-    }
-    elseif ($_POST['transition'] == "trans_notice_add")
-    {
-        echo_page_notice_add();
-    }
-    else
-    {
-        echo_page_main();
-    }
+    $stmt->execute();
+    return $stmt;
 }
 
-
-//ログイン認証
-function auth_login()
+function fetch_all(string $sql, string $types = '', array $params = []): array
 {
-    global $hostname, $username, $password, $dbname, $user_tablename;
-    global $is_member, $is_manager;
+    return query($sql, $types, $params)->get_result()->fetch_all(MYSQLI_ASSOC);
+}
 
-    $user = $_POST['user'];
-    $pass = $_POST['pass'];
+function post(string $key): string
+{
+    $value = $_POST[$key] ?? '';
+    return is_string($value) ? trim($value) : '';
+}
 
-    $link = mysqli_connect($hostname, $username, $password, $dbname);
-    if (!$link){ exit("Connect error!"); }
-    $result = mysqli_query($link, "SELECT * FROM $user_tablename");
-    if (!$result){ exit("Select error on table ($user_tablename)!"); } 
+// CSRF 対策のトークン。すべてのフォームに埋め込み、POST のたびに照合する
+function csrf_token(): string
+{
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
 
-    while ($row_assoc = mysqli_fetch_assoc($result))
-    {
-        if (($row_assoc['user'] == $user) && ($row_assoc['pass'] == $pass))
-        {
-            $is_member = 1;
-            $is_manager = $row_assoc['isManager'];
+function csrf_valid(): bool
+{
+    $sent = $_POST['csrf_token'] ?? '';
+    return is_string($sent) && !empty($_SESSION['csrf_token'])
+        && hash_equals($_SESSION['csrf_token'], $sent);
+}
+
+// フォームの開始タグと、画面遷移・CSRF 用の hidden 項目を出力する
+function form_open(string $transition, string $operation = ''): string
+{
+    $html = '<form method="POST" action="reservation_system.php">'
+          . '<input type="hidden" name="csrf_token" value="' . h(csrf_token()) . '">'
+          . '<input type="hidden" name="transition" value="' . h($transition) . '">';
+    if ($operation !== '') {
+        $html .= '<input type="hidden" name="operation" value="' . h($operation) . '">';
+    }
+    return $html;
+}
+
+function hidden(string $name, $value): string
+{
+    return '<input type="hidden" name="' . h($name) . '" value="' . h($value) . '">';
+}
+
+// yyyymmdd または yyyy-mm-dd を受け付け、yyyy-mm-dd に正規化する。不正なら null
+function normalize_date(string $input): ?string
+{
+    foreach (['Ymd', 'Y-m-d'] as $format) {
+        $date = DateTime::createFromFormat('!' . $format, $input);
+        if ($date !== false && $date->format($format) === $input) {
+            return $date->format('Y-m-d');
         }
     }
-
-    mysqli_free_result($result);
-    mysqli_close($link);
+    return null;
 }
 
-//サインアップ認証
-function auth_signup()
+function valid_tel(string $tel): bool
 {
-    global $hostname, $username, $password, $dbname, $user_tablename;
+    return $tel === '' || preg_match('/\A[0-9+\-]{1,20}\z/', $tel) === 1;
+}
 
-    $is_valid = 1;
-    if ($_POST['transition'] == "trans_signup_re")
-    {
-        $user = $_POST['user'];
-        $pass = $_POST['pass'];
+function str_length(string $value): int
+{
+    return mb_strlen($value, 'UTF-8');
+}
 
-        $link = mysqli_connect($hostname, $username, $password, $dbname);
-        if (!$link){ exit("Connect error!"); }
-        $result = mysqli_query($link, "SELECT * FROM $user_tablename");
-        if (!$result){ exit("Select error on table ($user_tablename)!"); } 
+// ------------------------------------------------------------
+// 認証
+// ------------------------------------------------------------
 
-        while ($row_assoc = mysqli_fetch_assoc($result))
-        {
-            if ($row_assoc['user'] == $user)
-            {
-                $is_valid = 0;
-            }
+// ログイン中のユーザーを毎回データベースから読み直す（権限の変更や削除をすぐに反映するため）
+function current_user(): ?array
+{
+    if (empty($_SESSION['user_id'])) {
+        return null;
+    }
+    $rows = fetch_all('SELECT id, user, isManager, birth, tel FROM ' . USER_TABLE . ' WHERE id = ?',
+                      'i', [$_SESSION['user_id']]);
+    if (!$rows) {
+        logout();
+        return null;
+    }
+    $rows[0]['isManager'] = (int)$rows[0]['isManager'];
+    return $rows[0];
+}
+
+function login(string $name, string $pass): bool
+{
+    $rows = fetch_all('SELECT id, pass FROM ' . USER_TABLE . ' WHERE user = ?', 's', [$name]);
+    if (!$rows) {
+        // ユーザーの有無で応答時間が変わらないよう、ダミーの照合を行う
+        password_verify($pass, '$2y$10$3BZVzgI8qDsEwzk/yC1bRO4nNlVoH0kzhdsmTORQPZ50gX93JHGZ.');
+        return false;
+    }
+    $id     = (int)$rows[0]['id'];
+    $stored = (string)$rows[0]['pass'];
+
+    if (empty(password_get_info($stored)['algo'])) {
+        // 旧バージョンで平文保存されたパスワード。一致したらハッシュに置き換える
+        if (!hash_equals($stored, $pass)) {
+            return false;
         }
+        update_password($id, $pass);
+    } elseif (!password_verify($pass, $stored)) {
+        return false;
+    } elseif (password_needs_rehash($stored, PASSWORD_DEFAULT)) {
+        update_password($id, $pass);
+    }
 
-        if ($is_valid == 1)
-        {
-            user_add();
+    session_regenerate_id(true);
+    $_SESSION['user_id'] = $id;
+    return true;
+}
+
+function logout(): void
+{
+    $_SESSION = [];
+    session_regenerate_id(true);
+}
+
+function update_password(int $id, string $pass): void
+{
+    query('UPDATE ' . USER_TABLE . ' SET pass = ? WHERE id = ?', 'si',
+          [password_hash($pass, PASSWORD_DEFAULT), $id]);
+}
+
+// 新規登録。成功したら null、失敗したらエラーメッセージを返す
+function signup(): ?string
+{
+    $name  = post('user');
+    $pass  = $_POST['pass'] ?? '';
+    $birth = post('birth');
+    $tel   = post('tel');
+
+    if ($name === '' || str_length($name) > NAME_MAX_LENGTH) {
+        return 'ユーザ名は1〜' . NAME_MAX_LENGTH . '文字で入力してください';
+    }
+    if (!is_string($pass) || strlen($pass) < PASSWORD_MIN_LENGTH) {
+        return 'パスワードは' . PASSWORD_MIN_LENGTH . '文字以上にしてください';
+    }
+    $birth_date = null;
+    if ($birth !== '') {
+        $birth_date = normalize_date($birth);
+        if ($birth_date === null) {
+            return '生年月日は yyyymmdd の形式で入力してください';
         }
+    }
+    if (!valid_tel($tel)) {
+        return '電話番号は数字とハイフンで入力してください';
+    }
+    if (fetch_all('SELECT id FROM ' . USER_TABLE . ' WHERE user = ?', 's', [$name])) {
+        return 'このユーザ名はすでに使用されています';
+    }
 
-        mysqli_free_result($result);
-        mysqli_close($link);
+    try {
+        query('INSERT INTO ' . USER_TABLE . ' (user, pass, isManager, birth, tel) VALUES (?, ?, 0, ?, ?)',
+              'ssss', [$name, password_hash($pass, PASSWORD_DEFAULT), $birth_date, $tel]);
+    } catch (mysqli_sql_exception $e) {
+        if ($e->getCode() === 1062) { // 同時に同じ名前で登録された場合
+            return 'このユーザ名はすでに使用されています';
+        }
+        throw $e;
+    }
+    login($name, $pass);
+    return null;
+}
+
+// ------------------------------------------------------------
+// データ操作（すべて呼び出し側でログインを確認済み）
+// ------------------------------------------------------------
+
+function reservation_add(array $me): ?string
+{
+    $date = normalize_date(post('date'));
+    $time = filter_var(post('time'), FILTER_VALIDATE_INT,
+                       ['options' => ['min_range' => OPEN_TIME, 'max_range' => CLOSE_TIME]]);
+    if ($date === null || $time === false) {
+        return '予約する日時が正しくありません';
+    }
+    if ($date < date('Y-m-d')) {
+        return '過去の日付は予約できません';
+    }
+    try {
+        query('INSERT INTO ' . RESERVATION_TABLE . ' (date, time, user) VALUES (?, ?, ?)',
+              'sis', [$date, $time, $me['user']]);
+    } catch (mysqli_sql_exception $e) {
+        if ($e->getCode() === 1062) { // 同じ枠がすでに予約されている
+            return 'その時間枠はすでに予約されています';
+        }
+        throw $e;
+    }
+    return null;
+}
+
+function reservation_delete(array $me): void
+{
+    $id = (int)post('reservation_id');
+    if ($me['isManager']) {
+        query('DELETE FROM ' . RESERVATION_TABLE . ' WHERE id = ?', 'i', [$id]);
+    } else {
+        // 一般ユーザーは自分の予約だけを削除できる
+        query('DELETE FROM ' . RESERVATION_TABLE . ' WHERE id = ? AND user = ?', 'is', [$id, $me['user']]);
     }
 }
 
-//ログイン画面表示
-function echo_page_login($msg)
+function user_edit(array $me): ?string
 {
-    echo <<<EOT
-        <body>
-            <h1>Login</h1><hr><hr>
-            <font color="red">$msg</font><br>
-            <form method="POST" action="reservation_system.php">
-                NAME <input type="text" name="user"><br>
-                PASS <input type="password" name="pass"><br>
-                <button type="submit" name="btn_login">Login</button>
-                <input type="hidden" name="transition" value="trans_login_re">
-            </form>
-            <br>
-            <hr><hr>
-            <form method="POST" action="reservation_system.php">
-                <button type="submit" name="btn_signup">Sign Up</button>
-                <input type="hidden" name="transition" value="trans_signup">
-            </form>
-        </body>
-EOT;
+    if (array_key_exists('new_pass', $_POST)) {
+        $current = $_POST['current_pass'] ?? '';
+        $new     = $_POST['new_pass'];
+        $stored  = fetch_all('SELECT pass FROM ' . USER_TABLE . ' WHERE id = ?', 'i', [$me['id']])[0]['pass'];
+        if (!is_string($current) || !password_verify($current, $stored)) {
+            return '現在のパスワードが違います';
+        }
+        if (!is_string($new) || strlen($new) < PASSWORD_MIN_LENGTH) {
+            return 'パスワードは' . PASSWORD_MIN_LENGTH . '文字以上にしてください';
+        }
+        update_password((int)$me['id'], $new);
+        session_regenerate_id(true);
+        return 'パスワードを変更しました';
+    }
+    if (array_key_exists('new_birth', $_POST)) {
+        $birth = normalize_date(post('new_birth'));
+        if ($birth === null) {
+            return '生年月日は yyyymmdd の形式で入力してください';
+        }
+        query('UPDATE ' . USER_TABLE . ' SET birth = ? WHERE id = ?', 'si', [$birth, $me['id']]);
+    }
+    if (array_key_exists('new_tel', $_POST)) {
+        $tel = post('new_tel');
+        if (!valid_tel($tel)) {
+            return '電話番号は数字とハイフンで入力してください';
+        }
+        query('UPDATE ' . USER_TABLE . ' SET tel = ? WHERE id = ?', 'si', [$tel, $me['id']]);
+    }
+    return null;
 }
 
-//サインアップ画面表示
-function echo_page_signup($msg)
+// 以下は管理者だけが実行できる操作
+
+function user_delete(array $me): ?string
 {
-    echo <<<EOT
-        <body>
-            <h1>Sign Up</h1><hr><hr>
-            <font color="red">$msg</font><br>
-            <form method="POST" action="reservation_system.php">
-                NAME <input type="text" name="user"><br>
-                PASS <input type="password" name="pass"><br>
-                BIRTH <input type="text" name="birth"><br>
-                TEL <input type="text" name="tel"><br>
-                <button type="submit" name="btn_signup">Sign Up</button>
-                <input type="hidden" name="transition" value="trans_signup_re">
-            </form>
-            <br>
-            <hr><hr>
-            <form method="POST" action="reservation_system.php">
-                <button type="submit" name="btn_login">Login</button>
-                <input type="hidden" name="transition" value="trans_login">
-            </form>
-        </body>
-EOT;
+    $id = (int)post('user_id');
+    if ($id === (int)$me['id']) {
+        return '自分自身は削除できません';
+    }
+    query('DELETE FROM ' . USER_TABLE . ' WHERE id = ?', 'i', [$id]);
+    return null;
 }
 
-//メイン画面表示
-function echo_page_main()
+function manager_set(array $me, int $flag): ?string
 {
-    global $hostname, $username, $password, $dbname, $reservation_tablename, $notice_tablename;
-    global $is_manager;
+    $id = (int)post('user_id');
+    if ($id === (int)$me['id']) {
+        return '自分自身の管理者権限は変更できません';
+    }
+    query('UPDATE ' . USER_TABLE . ' SET isManager = ? WHERE id = ?', 'ii', [$flag, $id]);
+    return null;
+}
 
-    $user = $_POST['user'];
-    $pass = $_POST['pass'];
+function notice_add(): ?string
+{
+    $date      = normalize_date(post('date'));
+    $notice    = post('notice');
+    $addressee = post('addressee');
+    if ($date === null) {
+        return '日付は yyyymmdd の形式で入力してください';
+    }
+    if ($notice === '' || $addressee === '' || str_length($addressee) > NAME_MAX_LENGTH) {
+        return '宛先と記事を入力してください';
+    }
+    query('INSERT INTO ' . NOTICE_TABLE . ' (date, notice, addressee) VALUES (?, ?, ?)',
+          'sss', [$date, $notice, $addressee]);
+    return null;
+}
 
-    echo '<body>';
-    echo '<h1>こんにちは、'.$user.'さん</h1><hr>';
-    if ($is_manager == 0)
-    {
-        echo '<hr><h3><現在のご予約></h3>';
+function notice_delete(): void
+{
+    query('DELETE FROM ' . NOTICE_TABLE . ' WHERE id = ?', 'i', [(int)post('notice_id')]);
+}
 
-        $link = mysqli_connect($hostname, $username, $password, $dbname);
-        if (!$link){ exit("Connect error!"); }
-        $result = mysqli_query($link, "SELECT * FROM $reservation_tablename WHERE user = '$user'");
-        if (!$result){ exit("Select error on table ($reservation_tablename)!"); } 
+// ------------------------------------------------------------
+// 画面
+// ------------------------------------------------------------
 
-        if (mysqli_num_rows($result) == 0)
-        {
+function message_html(string $msg): string
+{
+    return $msg === '' ? '' : '<font color="red">' . h($msg) . '</font><br>';
+}
+
+function echo_page_login(string $msg): void
+{
+    echo '<h1>Login</h1><hr><hr>';
+    echo message_html($msg);
+    echo form_open('trans_login_re');
+    echo '    NAME <input type="text" name="user" autocomplete="username"><br>';
+    echo '    PASS <input type="password" name="pass" autocomplete="current-password"><br>';
+    echo '    <button type="submit">Login</button>';
+    echo '</form><br><hr><hr>';
+    echo form_open('trans_signup');
+    echo '    <button type="submit">Sign Up</button>';
+    echo '</form>';
+}
+
+function echo_page_signup(string $msg): void
+{
+    echo '<h1>Sign Up</h1><hr><hr>';
+    echo message_html($msg);
+    echo form_open('trans_signup_re');
+    echo '    NAME <input type="text" name="user" maxlength="' . NAME_MAX_LENGTH . '" autocomplete="username"><br>';
+    echo '    PASS <input type="password" name="pass" minlength="' . PASSWORD_MIN_LENGTH . '" autocomplete="new-password">'
+       . '（' . PASSWORD_MIN_LENGTH . '文字以上）<br>';
+    echo '    BIRTH <input type="text" name="birth" placeholder="yyyymmdd"><br>';
+    echo '    TEL <input type="text" name="tel"><br>';
+    echo '    <button type="submit">Sign Up</button>';
+    echo '</form><br><hr><hr>';
+    echo form_open('trans_login');
+    echo '    <button type="submit">Login</button>';
+    echo '</form>';
+}
+
+function format_slot(array $row): string
+{
+    $time = (int)$row['time'];
+    return h($row['date']) . '<br>' . $time . ':00~' . ($time + 1) . ':00<br>';
+}
+
+function echo_page_main(array $me, string $msg): void
+{
+    echo '<h1>こんにちは、' . h($me['user']) . 'さん</h1><hr>';
+    echo message_html($msg);
+
+    if (!$me['isManager']) {
+        echo '<hr><h3>&lt;現在のご予約&gt;</h3>';
+        $rows = fetch_all('SELECT date, time FROM ' . RESERVATION_TABLE . ' WHERE user = ? ORDER BY date, time',
+                          's', [$me['user']]);
+        if (!$rows) {
             echo 'ご予約はありません';
-        } 
-        while ($row_assoc = mysqli_fetch_assoc($result))
-        {
-            $id = $row_assoc['id'];
-            echo $row_assoc['date'].'<br>';
-            echo $row_assoc['time'].':00~'.($row_assoc['time']+1).':00<br><br>';
         }
-        mysqli_free_result($result);
-        mysqli_close($link);
-
-        echo '<hr><h3><メニュー></h3>';
-        echo <<<EOT
-            <form method="post" action="reservation_system.php">
-                <button type="submit" name="btn_reservation_add">予約を追加する</button>
-                <input type="hidden" name="transition" value="trans_reservation_add">
-                <input type="hidden" name="user" value=$user>
-                <input type="hidden" name="pass" value=$pass>
-            </form>
-            <br>
-            <form method="post" action="reservation_system.php">
-                <button type="submit" name="btn_reservation_delete">予約を削除する</button>
-                <input type="hidden" name="transition" value="trans_reservation_delete">
-                <input type="hidden" name="user" value=$user>
-                <input type="hidden" name="pass" value=$pass>
-            </form>
-EOT;
-        echo '<hr><h3><おしらせ></h3>';
-
-        $link = mysqli_connect($hostname, $username, $password, $dbname);
-        if (!$link){ exit("Connect error!"); }
-        $result = mysqli_query($link, "SELECT * FROM $notice_tablename WHERE (addressee = '$user') OR (addressee = 'everyone')");
-        if (!$result){ exit("Select error on table ($notice_tablename)!"); } 
-
-        while ($row_assoc = mysqli_fetch_assoc($result))
-        {
-            echo $row_assoc['date'].'<br>';
-            echo $row_assoc['notice'].'<br><br>';
+        foreach ($rows as $row) {
+            echo format_slot($row) . '<br>';
         }
-        mysqli_free_result($result);
-        mysqli_close($link);
-    }
-    else
-    {
-        echo '<hr><h3><管理者メニュー></h3>';
-        echo <<<EOT
-            <form method="post" action="reservation_system.php">
-                <button type="submit" name="btn_user_manage">ユーザを管理する</button>
-                <input type="hidden" name="transition" value="trans_user_manage">
-                <input type="hidden" name="user" value=$user>
-                <input type="hidden" name="pass" value=$pass>
-            </form>
-            <br>
-            <form method="post" action="reservation_system.php">
-                <button type="submit" name="btn_reservation_manage">予約を管理する</button>
-                <input type="hidden" name="transition" value="trans_reservation_manage">
-                <input type="hidden" name="user" value=$user>
-                <input type="hidden" name="pass" value=$pass>
-            </form>
-            <br>
-            <form method="post" action="reservation_system.php">
-                <button type="submit" name="btn_notice_manage">投稿を管理する</button>
-                <input type="hidden" name="transition" value="trans_notice_manage">
-                <input type="hidden" name="user" value=$user>
-                <input type="hidden" name="pass" value=$pass>
-            </form>
-EOT;
+
+        echo '<hr><h3>&lt;メニュー&gt;</h3>';
+        echo form_open('trans_reservation_add') . '<button type="submit">予約を追加する</button></form><br>';
+        echo form_open('trans_reservation_delete') . '<button type="submit">予約を削除する</button></form>';
+
+        echo '<hr><h3>&lt;おしらせ&gt;</h3>';
+        $rows = fetch_all('SELECT date, notice FROM ' . NOTICE_TABLE
+                        . " WHERE addressee = ? OR addressee = 'everyone' ORDER BY date DESC",
+                          's', [$me['user']]);
+        foreach ($rows as $row) {
+            echo h($row['date']) . '<br>' . nl2br(h($row['notice'])) . '<br><br>';
+        }
+    } else {
+        echo '<hr><h3>&lt;管理者メニュー&gt;</h3>';
+        echo form_open('trans_user_manage') . '<button type="submit">ユーザを管理する</button></form><br>';
+        echo form_open('trans_reservation_manage') . '<button type="submit">予約を管理する</button></form><br>';
+        echo form_open('trans_notice_manage') . '<button type="submit">投稿を管理する</button></form>';
     }
     echo_footer();
 }
 
-//予約追加画面表示
-function echo_page_reservation_add()
+function echo_page_reservation_add(string $msg): void
 {
-    global $hostname, $username, $password, $dbname, $reservation_tablename;
-    global $open_time, $close_time;
-
-    $user = $_POST['user'];
-    $pass = $_POST['pass'];
-
-    echo '<body>';
     echo '<h1>予約の追加</h1><hr>';
-    if (!array_key_exists('date', $_POST))
-    {
+    echo message_html($msg);
+    $date = normalize_date(post('date'));
+
+    if ($date === null) {
+        if (post('date') !== '') {
+            echo message_html('日付は yyyymmdd の形式で入力してください');
+        }
         echo '<hr><h3>予約する日付を入力してください</h3>';
-        echo <<<EOT
-            <form method="POST" action="reservation_system.php">
-                yyyymmdd <input type="text" name="date"><br>
-                <button type="submit" name="btn_reservation_add">検索する</button>
-                <input type="hidden" name="transition" value="trans_reservation_add">
-                <input type="hidden" name="user" value=$user>
-                <input type="hidden" name="pass" value=$pass>
-            </form>
-EOT;
+        echo form_open('trans_reservation_add');
+        echo '    yyyymmdd <input type="text" name="date"><br>';
+        echo '    <button type="submit">検索する</button>';
+        echo '</form>';
+        echo_footer();
+        return;
     }
-    else
-    {
-        $date = $_POST['date'];
 
-        $reservation_list;
-        for ($i = $open_time; $i <= $close_time; $i++)
-        {
-            $reservation_list[$i] = 0;
+    $reserved = [];
+    foreach (fetch_all('SELECT time FROM ' . RESERVATION_TABLE . ' WHERE date = ?', 's', [$date]) as $row) {
+        $reserved[(int)$row['time']] = true;
+    }
+
+    echo '<hr><h3>' . h($date) . ' の予約する時間帯を選択してください</h3>';
+    $count = 0;
+    for ($i = OPEN_TIME; $i <= CLOSE_TIME; $i++) {
+        if (isset($reserved[$i])) {
+            continue;
         }
-
-        $link = mysqli_connect($hostname, $username, $password, $dbname);
-        if (!$link){ exit("Connect error!"); }
-        $result = mysqli_query($link, "SELECT * FROM $reservation_tablename where date = $date");
-        if (!$result){ exit("Select error on table ($reservation_tablename)!"); } 
-        
-        while ($row_assoc = mysqli_fetch_assoc($result))
-        {
-            $reservation_list[$row_assoc['time']] = 1;
-        }
-
-        $cnt = 0;
-        echo '<hr><h3>予約する時間帯を選択してください</h3>';
-        for ($i = $open_time; $i <= $close_time; $i++)
-        {
-            if ($reservation_list[$i] == 0)
-            {
-                $cnt++;
-                echo '<hr>';
-                echo $i.':00~'.($i+1).':00<br>';
-                echo <<<EOT
-            <form method="POST" action="reservation_system.php">
-                <button type="submit" name="btn_main">予約する</button>
-                <input type="hidden" name="transition" value="trans_main">
-                <input type="hidden" name="operation" value="reservation_add">
-                <input type="hidden" name="user" value=$user>
-                <input type="hidden" name="pass" value=$pass>
-                <input type="hidden" name="date" value=$date>
-                <input type="hidden" name="time" value=$i>
-            </form>
-EOT;
-            }
-        }
-        if ($cnt == 0)
-        {
-            echo 'ご希望の日はすでにご予約で埋まっています';
-        } 
-
-        mysqli_free_result($result);
-        mysqli_close($link);
+        $count++;
+        echo '<hr>' . $i . ':00~' . ($i + 1) . ':00<br>';
+        echo form_open('trans_main', 'reservation_add') . hidden('date', $date) . hidden('time', $i)
+           . '<button type="submit">予約する</button></form>';
+    }
+    if ($count === 0) {
+        echo 'ご希望の日はすでにご予約で埋まっています';
     }
     echo_footer();
 }
 
-//予約削除画面表示
-function echo_page_reservation_delete()
+function echo_page_reservation_delete(array $me): void
 {
-    global $hostname, $username, $password, $dbname, $reservation_tablename;
-
-    $user = $_POST['user'];
-    $pass = $_POST['pass'];
-
-    echo '<body>';
     echo '<h1>予約の削除</h1><hr>';
-    $link = mysqli_connect($hostname, $username, $password, $dbname);
-    if (!$link){ exit("Connect error!"); }
-    $result = mysqli_query($link, "SELECT * FROM $reservation_tablename WHERE user = '$user'");
-    if (!$result){ exit("Select error on table ($reservation_tablename)!"); } 
-
     echo '<hr><h3>削除する予約を選択してください</h3>';
-    while ($row_assoc = mysqli_fetch_assoc($result))
-    {
-        $id = $row_assoc['id'];
-        echo '<hr>';
-        echo $row_assoc['date'].'<br>';
-        echo $row_assoc['time'].':00~'.($row_assoc['time']+1).':00<br>';
-        echo <<<EOT
-        <form method="POST" action="reservation_system.php">
-            <button type="submit" name="btn_main">削除する</button>
-            <input type="hidden" name="transition" value="trans_reservation_delete">
-            <input type="hidden" name="operation" value="reservation_delete">
-            <input type="hidden" name="user" value=$user>
-            <input type="hidden" name="pass" value=$pass>
-            <input type="hidden" name="reservation_id" value=$id>
-        </form>
-EOT;
+    $rows = fetch_all('SELECT id, date, time FROM ' . RESERVATION_TABLE . ' WHERE user = ? ORDER BY date, time',
+                      's', [$me['user']]);
+    foreach ($rows as $row) {
+        echo '<hr>' . format_slot($row);
+        echo form_open('trans_reservation_delete', 'reservation_delete') . hidden('reservation_id', $row['id'])
+           . '<button type="submit">削除する</button></form>';
     }
-    mysqli_free_result($result);
-    mysqli_close($link);
     echo_footer();
 }
 
-//予約管理画面表示
-function echo_page_reservation_manage()
+function echo_page_reservation_manage(): void
 {
-    global $hostname, $username, $password, $dbname, $reservation_tablename;
-
-    $user = $_POST['user'];
-    $pass = $_POST['pass'];
-
-    echo '<body>';
     echo '<h1>予約の管理</h1><hr>';
-    $link = mysqli_connect($hostname, $username, $password, $dbname);
-    if (!$link){ exit("Connect error!"); }
-    $result = mysqli_query($link, "SELECT * FROM $reservation_tablename");
-    if (!$result){ exit("Select error on table ($reservation_tablename)!"); } 
-
-    while ($row_assoc = mysqli_fetch_assoc($result))
-    {
-        $id = $row_assoc['id'];
-        echo '<hr>';
-        echo 'NAME：'.$row_assoc['user'].'<br><br>';
-        echo $row_assoc['date'].'<br>';
-        echo $row_assoc['time'].':00~'.($row_assoc['time']+1).':00<br>';
-        echo <<<EOT
-        <form method="POST" action="reservation_system.php">
-            <button type="submit" name="btn">削除する</button>
-            <input type="hidden" name="transition" value="trans_reservation_manage">
-            <input type="hidden" name="operation" value="reservation_delete">
-            <input type="hidden" name="user" value=$user>
-            <input type="hidden" name="pass" value=$pass>
-            <input type="hidden" name="reservation_id" value=$id>
-        </form>
-EOT;
+    $rows = fetch_all('SELECT id, date, time, user FROM ' . RESERVATION_TABLE . ' ORDER BY date, time');
+    foreach ($rows as $row) {
+        echo '<hr>NAME：' . h($row['user']) . '<br><br>' . format_slot($row);
+        echo form_open('trans_reservation_manage', 'reservation_delete') . hidden('reservation_id', $row['id'])
+           . '<button type="submit">削除する</button></form>';
     }
-    mysqli_free_result($result);
-    mysqli_close($link);
     echo_footer();
 }
 
-//ユーザ管理画面表示
-function echo_page_user_manage()
+function echo_page_user_manage(array $me, string $msg): void
 {
-    global $hostname, $username, $password, $dbname, $user_tablename;
-
-    $user = $_POST['user'];
-    $pass = $_POST['pass'];
-
-    echo '<body>';
     echo '<h1>ユーザの管理</h1><hr>';
-    $link = mysqli_connect($hostname, $username, $password, $dbname);
-    if (!$link){ exit("Connect error!"); }
-    $result = mysqli_query($link, "SELECT * FROM $user_tablename");
-    if (!$result){ exit("Select error on table ($user_tablename)!"); } 
-
-    while ($row_assoc = mysqli_fetch_assoc($result))
-    {
-        $id = $row_assoc['id'];
-        echo '<hr>';
-        echo 'NAME ：'.$row_assoc['user'];
-        if ($row_assoc['isManager'] == 1)
-        {
+    echo message_html($msg);
+    $rows = fetch_all('SELECT id, user, isManager, birth, tel FROM ' . USER_TABLE . ' ORDER BY id');
+    foreach ($rows as $row) {
+        $is_self = (int)$row['id'] === (int)$me['id'];
+        echo '<hr>NAME ：' . h($row['user']);
+        if ((int)$row['isManager'] === 1) {
             echo '　　★';
         }
-        echo '<br>';
-        echo 'BIRTH：'.$row_assoc['birth'].'<br>';
-        echo 'TEL  ：'.$row_assoc['tel'].'<br>';
-        echo <<<EOT
-        <form method="POST" action="reservation_system.php">
-            <button type="submit" name="btn">削除する</button>
-            <input type="hidden" name="transition" value="trans_user_manage">
-            <input type="hidden" name="operation" value="user_delete">
-            <input type="hidden" name="user" value=$user>
-            <input type="hidden" name="pass" value=$pass>
-            <input type="hidden" name="user_id" value=$id>
-        </form>
-EOT;
-        if ($row_assoc['isManager'] == 0)
-        {
-            echo <<<EOT
-        <form method="POST" action="reservation_system.php">
-            <button type="submit" name="btn">管理者権限を有効にする</button>
-            <input type="hidden" name="transition" value="trans_user_manage">
-            <input type="hidden" name="operation" value="manager_add">
-            <input type="hidden" name="user" value=$user>
-            <input type="hidden" name="pass" value=$pass>
-            <input type="hidden" name="user_id" value=$id>
-        </form>
-EOT;
+        echo '<br>BIRTH：' . h($row['birth']) . '<br>';
+        echo 'TEL  ：' . h($row['tel']) . '<br>';
+        if ($is_self) {
+            echo '（ログイン中のユーザ）<br>';
+            continue;
         }
-        else
-        {
-            echo <<<EOT
-        <form method="POST" action="reservation_system.php">
-            <button type="submit" name="btn">管理者権限を無効にする</button>
-            <input type="hidden" name="transition" value="trans_user_manage">
-            <input type="hidden" name="operation" value="manager_delete">
-            <input type="hidden" name="user" value=$user>
-            <input type="hidden" name="pass" value=$pass>
-            <input type="hidden" name="user_id" value=$id>
-        </form>
-EOT;
+        echo form_open('trans_user_manage', 'user_delete') . hidden('user_id', $row['id'])
+           . '<button type="submit">削除する</button></form>';
+        if ((int)$row['isManager'] === 0) {
+            echo form_open('trans_user_manage', 'manager_add') . hidden('user_id', $row['id'])
+               . '<button type="submit">管理者権限を有効にする</button></form>';
+        } else {
+            echo form_open('trans_user_manage', 'manager_delete') . hidden('user_id', $row['id'])
+               . '<button type="submit">管理者権限を無効にする</button></form>';
         }
     }
     echo_footer();
 }
 
-//投稿管理画面表示
-function echo_page_notice_manage()
+function echo_page_notice_manage(string $msg): void
 {
-    global $hostname, $username, $password, $dbname, $notice_tablename;
-
-    $user = $_POST['user'];
-    $pass = $_POST['pass'];
-
-    echo '<body>';
     echo '<h1>投稿の管理</h1><hr>';
-    $link = mysqli_connect($hostname, $username, $password, $dbname);
-    if (!$link){ exit("Connect error!"); }
-    $result = mysqli_query($link, "SELECT * FROM $notice_tablename");
-    if (!$result){ exit("Select error on table ($notice_tablename)!"); } 
-
-    echo '<hr>';
-    echo <<<EOT
-        <br>
-        <form method="POST" action="reservation_system.php">
-            <button type="submit" name="btn">追加する</button>
-            <input type="hidden" name="transition" value="trans_notice_add">
-            <input type="hidden" name="user" value=$user>
-            <input type="hidden" name="pass" value=$pass>
-        </form>
-EOT;
-    while ($row_assoc = mysqli_fetch_assoc($result))
-    {
-        $id = $row_assoc['id'];
-        echo '<hr>';
-        echo '宛先:'.$row_assoc['addressee'].'<br>';
-        echo $row_assoc['date'].'<br>';
-        echo $row_assoc['notice'].'<br>';
-        echo <<<EOT
-        <br>
-        <form method="POST" action="reservation_system.php">
-            <button type="submit" name="btn">削除する</button>
-            <input type="hidden" name="transition" value="trans_notice_manage">
-            <input type="hidden" name="operation" value="notice_delete">
-            <input type="hidden" name="user" value=$user>
-            <input type="hidden" name="pass" value=$pass>
-            <input type="hidden" name="notice_id" value=$id>
-        </form>
-EOT;
+    echo message_html($msg);
+    echo '<hr><br>';
+    echo form_open('trans_notice_add') . '<button type="submit">追加する</button></form>';
+    $rows = fetch_all('SELECT id, date, notice, addressee FROM ' . NOTICE_TABLE . ' ORDER BY date DESC');
+    foreach ($rows as $row) {
+        echo '<hr>宛先:' . h($row['addressee']) . '<br>' . h($row['date']) . '<br>' . nl2br(h($row['notice'])) . '<br><br>';
+        echo form_open('trans_notice_manage', 'notice_delete') . hidden('notice_id', $row['id'])
+           . '<button type="submit">削除する</button></form>';
     }
     echo_footer();
 }
 
-//投稿追加画面表示
-function echo_page_notice_add()
+function echo_page_notice_add(): void
 {
-    global $hostname, $username, $password, $dbname, $notice_tablename;
-
-    $user = $_POST['user'];
-    $pass = $_POST['pass'];
-
-    echo '<body>';
-    echo '<h1>投稿の追加</h1><hr>';
-
-    echo '<hr>';
-    echo <<<EOT
-    <form method="POST" action="reservation_system.php">
-        宛先<textarea name="addressee" rows="1" cols="10">everyone</textarea><br>
-        日付<input type="text" name="date"><br>
-        記事<textarea name="notice" rows="5" cols="30"></textarea>
-        <br>
-        <button type="submit" name="btn_user_edit">投稿する</button>
-        <input type="hidden" name="transition" value="trans_notice_manage">
-        <input type="hidden" name="operation" value="notice_add">
-        <input type="hidden" name="user" value=$user>
-        <input type="hidden" name="pass" value=$pass>
-    </form>
-EOT;
+    echo '<h1>投稿の追加</h1><hr><hr>';
+    echo form_open('trans_notice_manage', 'notice_add');
+    echo '    宛先<textarea name="addressee" rows="1" cols="10">everyone</textarea><br>';
+    echo '    日付<input type="text" name="date" placeholder="yyyymmdd"><br>';
+    echo '    記事<textarea name="notice" rows="5" cols="30"></textarea><br>';
+    echo '    <button type="submit">投稿する</button>';
+    echo '</form>';
     echo_footer();
 }
 
-//ユーザ編集画面表示
-function echo_page_user_edit()
+function echo_page_user_edit(array $me, string $msg): void
 {
-    global $hostname, $username, $password, $dbname, $user_tablename;
-    global $is_manager;
-
-    $user = $_POST['user'];
-    $pass = $_POST['pass'];
-
-    echo '<body>';
     echo '<h1>アカウントの管理</h1><hr>';
-    $link = mysqli_connect($hostname, $username, $password, $dbname);
-    if (!$link){ exit("Connect error!"); }
-    $result = mysqli_query($link, "SELECT * FROM $user_tablename WHERE user = '$user'");
-    if (!$result){ exit("Select error on table ($user_tablename)!"); } 
-    
-    $row_assoc = mysqli_fetch_assoc($result);
-
-    $pass = $row_assoc['pass'];
-    
-    echo '<hr>';
-    echo 'PASS：'.$row_assoc['pass'];
-    echo <<<EOT
-    <form method="POST" action="reservation_system.php">
-        <input type="text" name="new_pass"><br>
-        <button type="submit" name="btn_user_edit">変更する</button>
-        <input type="hidden" name="transition" value="trans_user_edit">
-        <input type="hidden" name="operation" value="user_edit">
-        <input type="hidden" name="user" value=$user>
-        <input type="hidden" name="pass" value=$pass>
-    </form>
-    <br>
-EOT;
-    echo 'BIRTH：'.$row_assoc['birth'];
-    echo <<<EOT
-    <form method="POST" action="reservation_system.php">
-        <input type="text" name="new_birth"><br>
-        <button type="submit" name="btn_user_edit">変更する</button>
-        <input type="hidden" name="transition" value="trans_user_edit">
-        <input type="hidden" name="operation" value="user_edit">
-        <input type="hidden" name="user" value=$user>
-        <input type="hidden" name="pass" value=$pass>
-    </form>
-    <br>
-EOT;
-    echo 'TEL：'.$row_assoc['tel'];
-    echo <<<EOT
-    <form method="POST" action="reservation_system.php">
-        <input type="text" name="new_tel"><br>
-        <button type="submit" name="btn_user_edit">変更する</button>
-        <input type="hidden" name="transition" value="trans_user_edit">
-        <input type="hidden" name="operation" value="user_edit">
-        <input type="hidden" name="user" value=$user>
-        <input type="hidden" name="pass" value=$pass>
-    </form>
-    EOT;
-    mysqli_free_result($result);
-    mysqli_close($link);
+    echo message_html($msg);
+    echo '<hr>PASS：********';
+    echo form_open('trans_user_edit', 'user_edit');
+    echo '    現在のパスワード <input type="password" name="current_pass" autocomplete="current-password"><br>';
+    echo '    新しいパスワード <input type="password" name="new_pass" minlength="' . PASSWORD_MIN_LENGTH
+       . '" autocomplete="new-password"><br>';
+    echo '    <button type="submit">変更する</button>';
+    echo '</form><br>';
+    echo 'BIRTH：' . h($me['birth']);
+    echo form_open('trans_user_edit', 'user_edit');
+    echo '    <input type="text" name="new_birth" placeholder="yyyymmdd"><br>';
+    echo '    <button type="submit">変更する</button>';
+    echo '</form><br>';
+    echo 'TEL：' . h($me['tel']);
+    echo form_open('trans_user_edit', 'user_edit');
+    echo '    <input type="text" name="new_tel"><br>';
+    echo '    <button type="submit">変更する</button>';
+    echo '</form>';
     echo_footer();
 }
 
-//フッター表示
-function echo_footer()
+function echo_footer(): void
 {
-    $user = $_POST['user'];
-    $pass = $_POST['pass'];
-
-    echo <<<EOT
-        <br>
-        <hr><hr>
-        <form method="POST" action="reservation_system.php">
-                <button type="submit" name="btn_main">ホームへ戻る</button>
-                <input type="hidden" name="transition" value="trans_main">
-                <input type="hidden" name="user" value=$user>
-                <input type="hidden" name="pass" value=$pass>
-        </form>
-        <br><br>
-        <form method="post" action="reservation_system.php">
-            <button type="submit" name="btn_user_edit">Account</button>
-            <input type="hidden" name="transition" value="trans_user_edit">
-            <input type="hidden" name="user" value=$user>
-            <input type="hidden" name="pass" value=$pass>
-        </form>
-        <form method="POST" action="reservation_system.php">
-                <button type="submit" name="btn_logout">Logout</button>
-                <input type="hidden" name="transition" value="trans_login">
-        </form>
-        </body>
-EOT;
+    echo '<br><hr><hr>';
+    echo form_open('trans_main') . '<button type="submit">ホームへ戻る</button></form><br><br>';
+    echo form_open('trans_user_edit') . '<button type="submit">Account</button></form>';
+    echo form_open('trans_logout') . '<button type="submit">Logout</button></form>';
 }
 
-//ユーザ追加
-function user_add()
+// ------------------------------------------------------------
+// リクエストの処理
+// ------------------------------------------------------------
+
+// 操作を実行し、画面に出すメッセージを返す。権限のない操作は実行しない
+function run_operation(array $me, string $operation): string
 {
-    global $hostname, $username, $password, $dbname, $user_tablename;
+    $user_operations = ['reservation_add', 'reservation_delete', 'user_edit'];
+    $manager_operations = ['user_delete', 'manager_add', 'manager_delete', 'notice_add', 'notice_delete'];
 
-    $user = $_POST['user'];
-    $pass = $_POST['pass'];
-    $tel = $_POST['tel'];
-    $birth = $_POST['birth'];
-
-    $link = mysqli_connect($hostname, $username, $password, $dbname);
-    if (!$link){ exit("Connect error!"); }
-    $result = mysqli_query($link,"INSERT INTO $user_tablename SET user = '$user', pass = '$pass', tel = '$tel', birth = '$birth', isManager = 0");
-    if (!$result){ exit("Insert error on table ($user_tablename)!"); } 
-
-    mysqli_close($link);
-}
-
-//ユーザ削除
-function user_delete()
-{
-    global $hostname, $username, $password, $dbname, $user_tablename;
-
-    $id = $_POST['user_id'];
-
-    $link = mysqli_connect($hostname, $username, $password, $dbname);
-    if (!$link){ exit("Connect error!"); }
-    $result = mysqli_query($link,"DELETE FROM $user_tablename WHERE id = $id");
-    if (!$result){ exit("Delete error on table ($user_tablename)!"); } 
-
-    mysqli_close($link);
-}
-
-//ユーザ編集
-function user_edit()
-{
-    global $hostname, $username, $password, $dbname, $user_tablename;
-
-    $user = $_POST['user'];
-
-    $link = mysqli_connect($hostname, $username, $password, $dbname);
-    if (!$link){ exit("Connect error!"); }
-
-    if (array_key_exists('new_pass', $_POST))
-    {
-        $new_pass = $_POST['new_pass'];
-
-        $result = mysqli_query($link,"UPDATE $user_tablename SET pass = '$new_pass' WHERE user = '$user'");
-        if (!$result){ exit("Update error on table ($user_tablename)!"); } 
+    if (in_array($operation, $manager_operations, true) && !$me['isManager']) {
+        return 'この操作を行う権限がありません';
     }
-    if (array_key_exists('new_birth', $_POST))
-    {
-        $new_birth = $_POST['new_birth'];
-
-        $result = mysqli_query($link,"UPDATE $user_tablename SET birth = '$new_birth' WHERE user = '$user'");
-        if (!$result){ exit("Update error on table ($user_tablename)!"); } 
+    if (!in_array($operation, $user_operations, true) && !in_array($operation, $manager_operations, true)) {
+        return '';
     }
-    if (array_key_exists('new_tel', $_POST))
-    {
-        $new_tel = $_POST['new_tel'];
 
-        $result = mysqli_query($link,"UPDATE $user_tablename SET tel = '$new_tel' WHERE user = '$user'");
-        if (!$result){ exit("Update error on table ($user_tablename)!"); } 
+    switch ($operation) {
+        case 'reservation_add':    return reservation_add($me) ?? '';
+        case 'reservation_delete': reservation_delete($me); return '';
+        case 'user_edit':          return user_edit($me) ?? '';
+        case 'user_delete':        return user_delete($me) ?? '';
+        case 'manager_add':        return manager_set($me, 1) ?? '';
+        case 'manager_delete':     return manager_set($me, 0) ?? '';
+        case 'notice_add':         return notice_add() ?? '';
+        case 'notice_delete':      notice_delete(); return '';
     }
-    mysqli_close($link);
+    return '';
 }
 
-//予約追加
-function reservation_add()
+function handle_request(): void
 {
-    global $hostname, $username, $password, $dbname, $reservation_tablename;
+    $is_post    = ($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST';
+    $transition = $is_post ? post('transition') : '';
+    $msg        = '';
 
-    $date = $_POST['date'];
-    $time = $_POST['time'];
-    $user = $_POST['user'];
+    if ($is_post && !csrf_valid()) {
+        echo_page_login('セッションの有効期限が切れました。もう一度ログインしてください');
+        return;
+    }
 
-    $link = mysqli_connect($hostname, $username, $password, $dbname);
-    if (!$link){ exit("Connect error!"); }
-    $result = mysqli_query($link,"INSERT INTO $reservation_tablename SET date = '$date', time = $time, user = '$user'");
-    if (!$result){ exit("Insert error on table ($reservation_tablename)!"); } 
+    if ($transition === 'trans_logout') {
+        logout();
+        echo_page_login('');
+        return;
+    }
+    if ($transition === 'trans_login_re') {
+        $pass = $_POST['pass'] ?? '';
+        if (!is_string($pass) || !login(post('user'), $pass)) {
+            echo_page_login('ユーザ名またはパスワードが違います');
+            return;
+        }
+        $transition = 'trans_main';
+    }
+    if ($transition === 'trans_signup_re') {
+        $error = signup();
+        if ($error !== null) {
+            echo_page_signup($error);
+            return;
+        }
+        $transition = 'trans_main';
+    }
 
-    mysqli_close($link);
+    $me = current_user();
+    if ($me === null) {
+        if ($transition === 'trans_signup') {
+            echo_page_signup('');
+        } else {
+            echo_page_login('');
+        }
+        return;
+    }
+
+    if ($is_post && post('operation') !== '') {
+        $msg = run_operation($me, post('operation'));
+        $me  = current_user() ?? $me;
+    }
+
+    $manager_pages = ['trans_user_manage', 'trans_reservation_manage', 'trans_notice_manage', 'trans_notice_add'];
+    if (in_array($transition, $manager_pages, true) && !$me['isManager']) {
+        echo_page_main($me, 'この画面を表示する権限がありません');
+        return;
+    }
+
+    switch ($transition) {
+        case 'trans_reservation_add':    echo_page_reservation_add($msg); break;
+        case 'trans_reservation_delete': echo_page_reservation_delete($me); break;
+        case 'trans_user_edit':          echo_page_user_edit($me, $msg); break;
+        case 'trans_user_manage':        echo_page_user_manage($me, $msg); break;
+        case 'trans_reservation_manage': echo_page_reservation_manage(); break;
+        case 'trans_notice_manage':      echo_page_notice_manage($msg); break;
+        case 'trans_notice_add':         echo_page_notice_add(); break;
+        default:                         echo_page_main($me, $msg); break;
+    }
 }
 
-//予約削除
-function reservation_delete()
-{
-    global $hostname, $username, $password, $dbname, $reservation_tablename;
-
-    $id = $_POST['reservation_id'];
-
-    $link = mysqli_connect($hostname, $username, $password, $dbname);
-    if (!$link){ exit("Connect error!"); }
-    $result = mysqli_query($link,"DELETE FROM $reservation_tablename WHERE id = $id");
-    if (!$result){ exit("Delete error on table ($reservation_tablename)!"); } 
-
-    mysqli_close($link);
+ob_start();
+try {
+    handle_request();
+    $body = ob_get_clean();
+} catch (mysqli_sql_exception $e) {
+    ob_end_clean();
+    error_log('reservation_system: ' . $e->getMessage());
+    http_response_code(500);
+    $body = '<h1>エラー</h1><p>データベースの処理中にエラーが発生しました。</p>';
 }
-
-//投稿追加
-function notice_add()
-{
-    global $hostname, $username, $password, $dbname, $notice_tablename;
-
-    $date = $_POST['date'];
-    $notice = $_POST['notice'];
-    $addressee = $_POST['addressee'];
-
-    $link = mysqli_connect($hostname, $username, $password, $dbname);
-    if (!$link){ exit("Connect error!"); }
-    $result = mysqli_query($link,"INSERT INTO $notice_tablename SET date = '$date', notice = '$notice', addressee = '$addressee'");
-    if (!$result){ exit("Insert error on table ($notice_tablename)!"); } 
-
-    mysqli_close($link);
-}
-
-//投稿削除
-function notice_delete()
-{
-    global $hostname, $username, $password, $dbname, $notice_tablename;
-
-    $id = $_POST['notice_id'];
-
-    $link = mysqli_connect($hostname, $username, $password, $dbname);
-    if (!$link){ exit("Connect error!"); }
-    $result = mysqli_query($link,"DELETE FROM $notice_tablename WHERE id = $id");
-    if (!$result){ exit("Delete error on table ($notice_tablename)!"); } 
-
-    mysqli_close($link);
-}
-
-//管理者権限追加
-function manager_add()
-{
-    global $hostname, $username, $password, $dbname, $user_tablename;
-
-    $id = $_POST['user_id'];
-
-    $link = mysqli_connect($hostname, $username, $password, $dbname);
-    if (!$link){ exit("Connect error!"); }
-    $result = mysqli_query($link,"UPDATE $user_tablename SET isManager = 1 WHERE id = '$id'");
-    if (!$result){ exit("Update error on table ($user_tablename)!"); } 
-    
-    mysqli_close($link);
-}
-
-//管理者権限削除
-function manager_delete()
-{
-    global $hostname, $username, $password, $dbname, $user_tablename;
-
-    $id = $_POST['user_id'];
-
-    $link = mysqli_connect($hostname, $username, $password, $dbname);
-    if (!$link){ exit("Connect error!"); }
-    $result = mysqli_query($link,"UPDATE $user_tablename SET isManager = 0 WHERE id = '$id'");
-    if (!$result){ exit("Update error on table ($user_tablename)!"); } 
-    
-    mysqli_close($link);
-}
-
 ?>
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Reservation System</title>
+</head>
+<body>
+<?= $body ?>
+</body>
 </html>
