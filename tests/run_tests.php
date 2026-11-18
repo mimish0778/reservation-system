@@ -132,6 +132,17 @@ $alice->post(['transition' => 'trans_main', 'operation' => 'reservation_add', 'd
 check('不正な時刻は受け付けない', str_contains($alice->text(), '日時が正しくありません') && scalar('SELECT COUNT(*) FROM userTable') >= 3);
 $alice->post(['transition' => 'trans_main', 'operation' => 'reservation_add', 'date' => '20000101', 'time' => '10']);
 check('過去の日付は予約できない', str_contains($alice->text(), '過去の日付'));
+// 今日の時間枠は、過ぎた時間帯（日本時間）を除いて表示され、過ぎた時間帯は予約できない
+$tokyo_now  = new DateTime('now', new DateTimeZone('Asia/Tokyo'));
+$today      = $tokyo_now->format('Ymd');
+$hour       = (int)$tokyo_now->format('G');
+$open_slots = count(array_filter(range(9, 18), fn($h) => $h > $hour));
+$alice->post(['transition' => 'trans_reservation_add', 'date' => $today]);
+check('今日は過ぎた時間帯を除いて表示する', substr_count($alice->html, '>予約する</button>') === $open_slots);
+if ($hour >= 9) {
+    $alice->post(['transition' => 'trans_main', 'operation' => 'reservation_add', 'date' => $today, 'time' => '9']);
+    check('今日の過ぎた時間帯は予約できない', str_contains($alice->text(), 'すでに始まっている時間帯'));
+}
 $alice->post(['transition' => 'trans_reservation_add', 'date' => "{$future}' OR '1'='1"]);
 check('不正な日付では検索しない', str_contains($alice->text(), 'yyyymmdd の形式'));
 

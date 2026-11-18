@@ -11,6 +11,11 @@ const OPEN_TIME  = 9;   // 最初の枠の開始時刻
 const CLOSE_TIME = 18;  // 最後の枠の開始時刻
 
 const PASSWORD_MIN_LENGTH = 8;
+
+// 「今日」や「過ぎた時間帯」の判定に使うタイムゾーン。PHP の既定（UTC のことが多い）のままだと
+// 日本時間の 0〜9 時に日付が 1 日ずれる
+const TIMEZONE = 'Asia/Tokyo';
+date_default_timezone_set(TIMEZONE);
 const NAME_MAX_LENGTH     = 50;
 
 // ------------------------------------------------------------
@@ -106,6 +111,13 @@ function form_open(string $transition, string $operation = ''): string
 function hidden(string $name, $value): string
 {
     return '<input type="hidden" name="' . h($name) . '" value="' . h($value) . '">';
+}
+
+// その時間枠がすでに始まっている（過去の日付、または今日の過ぎた時間帯）か
+function slot_started(string $date, int $time): bool
+{
+    $today = date('Y-m-d');
+    return $date < $today || ($date === $today && $time <= (int)date('G'));
 }
 
 // yyyymmdd または yyyy-mm-dd を受け付け、yyyy-mm-dd に正規化する。不正なら null
@@ -245,6 +257,9 @@ function reservation_add(array $me): ?string
     }
     if ($date < date('Y-m-d')) {
         return '過去の日付は予約できません';
+    }
+    if (slot_started($date, $time)) {
+        return 'すでに始まっている時間帯は予約できません';
     }
     try {
         query('INSERT INTO ' . RESERVATION_TABLE . ' (date, time, user) VALUES (?, ?, ?)',
@@ -454,7 +469,7 @@ function echo_page_reservation_add(string $msg): void
     echo '<hr><h3>' . h($date) . ' の予約する時間帯を選択してください</h3>';
     $count = 0;
     for ($i = OPEN_TIME; $i <= CLOSE_TIME; $i++) {
-        if (isset($reserved[$i])) {
+        if (isset($reserved[$i]) || slot_started($date, $i)) {
             continue;
         }
         $count++;
@@ -463,7 +478,7 @@ function echo_page_reservation_add(string $msg): void
            . '<button type="submit">予約する</button></form>';
     }
     if ($count === 0) {
-        echo 'ご希望の日はすでにご予約で埋まっています';
+        echo 'ご希望の日に予約できる時間帯はありません';
     }
     echo_footer();
 }
