@@ -739,7 +739,8 @@ try {
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <title>Reservation System</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>予約管理システム</title>
 </head>
 <body>
 <?= $body ?>
